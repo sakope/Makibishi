@@ -1,0 +1,135 @@
+﻿#pragma kernel Initialize
+#pragma kernel Iterator
+
+#include "UnityCG.cginc"
+#include "../Cgincs/Noise.cginc"
+#include "../Cgincs/Math.cginc"
+#include "../Cgincs/SimplexNoiseGrad3D.cginc"
+
+#define THREAD_GROUP 64
+
+uint requiredThread;
+
+struct RewritableBuffer
+{
+    float4 position;
+    float4 velocity;
+    float4 rotation;
+};
+
+float3 emitterPos;
+float3 emitterSize;
+float2 lifeParams;
+float4 direction;
+float2 speedParams;
+float4 acceleration;  // x, y, z, drag
+float3 spinParams;    // spin*2, speed-to-spin*2, randomness
+float2 noiseParams;
+float3 noiseOffset;
+float4 config;        // isLoop(loop is 0, one shot is 1), random seed, delta time, time
+
+RWStructuredBuffer<RewritableBuffer> _rwBuf;
+
+float4 InitializePosition(uint3 id)
+{
+    float t = config.w;
+
+    float3 p = float3(rnd((float2)id.x, float2(t, config.y)), rnd((float2)id.x, float2(t + 1, config.y)), rnd((float2)id.x, float2(t + 2, config.y)));
+    p = (p - (float3)0.5) * emitterSize + emitterPos;
+
+    return float4(p, 0.5);
+}
+
+float4 InitializeVelocity(uint3 id)
+{
+    float3 v = float3(rnd((float2)id.x, float2(6, config.y)), rnd((float2)id.x, float2(7, config.y)), rnd((float2)id.x, float2(8, config.y)));
+    v = (v - (float3)0.5) * 2;
+
+    v = lerp(direction.xyz, v, direction.w);
+
+    v = normalize(v) * speedParams.x;
+    v *= 1.0 - rnd((float2)id.x, float2(9, config.y)) * speedParams.y;
+
+    return float4(v, 0);
+}
+
+float4 InitializeRotation(uint3 id)
+{
+    // Uniform random unit quaternion
+    // http://www.realtimerendering.com/resources/GraphicsGems/gemsiii/urot.c
+    float r = rnd((float2)id.x, float2(3, config.y));
+    float r1 = sqrt(1.0 - r);
+    float r2 = sqrt(r);
+    float t1 = UNITY_PI * 2 * rnd((float2)id.x, float2(4, config.y));
+    float t2 = UNITY_PI * 2 * rnd((float2)id.x, float2(5, config.y));
+    return float4(sin(t1) * r1, cos(t1) * r1, sin(t2) * r2, cos(t2) * r2);
+}
+
+// Deterministic random rotation axis
+float3 GetRotationAxis(uint3 id)
+{
+    // Uniformaly distributed points
+    // http://mathworld.wolfram.com/SpherePointPicking.html
+    float u = rnd((float2)id.x, float2(10, config.y)) * 2 - 1;
+    float theta = rnd((float2)id.x, float2(11, config.y)) * UNITY_PI * 2;
+    float u2 = sqrt(1 - u * u);
+    return float3(u2 * cos(theta), u2 * sin(theta), u);
+}
+
+[numthreads(THREAD_GROUP, 1, 1)]
+void Initialize(uint3 id : SV_DispatchThreadID)
+{
+    if(id.x < requiredThread)
+    {
+        _rwBuf[id.x].position = InitializePosition(id) - float4(0, 0, 0, rnd((float2)id.x, float2(14, config.y)));
+        _rwBuf[id.x].velocity = InitializeVelocity(id);
+        _rwBuf[id.x].rotation = InitializeRotation(id);
+    }
+}
+
+[numthreads(THREAD_GROUP, 1, 1)]
+void Iterator(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < requiredThread)
+    {
+        float dt = config.z;
+        _rwBuf[id.x].position.w -= lerp(lifeParams.x, lifeParams.y, rnd((float2)id.x, float2(12, config.y))) * dt;
+
+        if (_rwBuf[id.x].position.w > -0.5)
+        {
+            _rwBuf[id.x].position.xyz += _rwBuf[id.x].velocity.xyz * dt;
+        }
+        else
+        {
+            float4 remove = float4(1e8, 1e8, 1e8, -1) * config.x;
+            _rwBuf[id.x].position = InitializePosition(id) + remove;
+        }
+
+        if (_rwBuf[id.x].position.w < 0.5)
+        {
+            // Drag
+            _rwBuf[id.x].velocity.xyz *= acceleration.w; // dt is pre-applied in script
+            _rwBuf[id.x].velocity.xyz += acceleration.xyz * dt;
+
+            // Acceleration by turbulent noise
+            float3 np = (_rwBuf[id.x].position.xyz + noiseOffset) * noiseParams.x;
+            float3 n1 = snoise_grad(np);
+            float3 n2 = snoise_grad(np + float3(0, 13.28, 0));
+            _rwBuf[id.x].velocity.xyz += cross(n1, n2) * noiseParams.y * dt;
+            _rwBuf[id.x].velocity.w = 0;
+        }
+        else
+        {
+            _rwBuf[id.x].velocity = InitializeVelocity(id);
+        }
+
+        // Delta angle
+        float theta = (spinParams.x + length(_rwBuf[id.x].velocity.xyz) * spinParams.y) * dt;
+        // Randomness
+        theta *= 1.0 - rnd((float2)id.x, float2(13, config.y)) * spinParams.z;
+        // Spin quaternion
+        float4 dq = float4(GetRotationAxis(id) * sin(theta), cos(theta));
+        // Applying the quaternion and normalize the result.
+        _rwBuf[id.x].rotation = normalize(qmul(dq, _rwBuf[id.x].rotation));
+    }
+}
